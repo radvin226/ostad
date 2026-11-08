@@ -8,11 +8,13 @@ import asyncio
 import html
 import logging
 import os
+import time
 from datetime import datetime
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -24,13 +26,19 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 # ============================ تنظیمات ============================
+# همه‌ی این‌ها از متغیر محیطی خونده می‌شن؛ مقدار پیش‌فرض فقط برای تست محلیه
 BOT_TOKEN = os.getenv("9201680404:AAFe2RAWyF3Sn9lnLXbCcgEQYFUSDzAYf8I", "9201680404:AAFe2RAWyF3Sn9lnLXbCcgEQYFUSDzAYf8I")
-ADMIN_IDS = {6420547446}                       # آیدی عددی ادمین(ها)
-REQUIRED_CHANNEL = "@sofi_vpn"                # کانال اجباری (ربات باید ادمین کانال باشد)
+ADMIN_IDS = {int(x) for x in os.getenv("6420547446,5088592670","6420547446,5088592670").split(",") if x.strip()}
+REQUIRED_CHANNEL = "@sofi_vpn"                 # کانال اجباری؛ ربات باید در این کانال ادمین باشد
 CHANNEL_URL = "https://t.me/sofi_vpn"
-DEFAULT_CARD = "6037-0000-0000-0000"          # شماره کارت پیش‌فرض (از پنل ادمین قابل تغییر است)
-DB_URL = "sqlite+aiosqlite:///shop.db"
+DEFAULT_CARD = "6037-0000-0000-0000"           # از پنل ادمین قابل تغییره
+DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:///shop.db")
+
 WELCOME = "🏠 <b>منوی اصلی</b>\nیکی از خدمات زیر را انتخاب کنید:"
+JOIN_TEXT = ("👋 برای استفاده از ربات ابتدا باید در کانال ما عضو شوید.\n\n"
+             "پس از عضویت، دکمه «✅ عضو شدم» را بزنید.")
+NOT_MEMBER_ALERT = "❌ هنوز عضو کانال نشده‌اید!"
+SERVICE_DOWN_TEXT = "⚠️ بررسی عضویت در حال حاضر ممکن نیست. کمی بعد دوباره تلاش کنید."
 
 # ============================ دیتابیس ============================
 class Base(DeclarativeBase):
@@ -41,7 +49,7 @@ class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)  # آیدی تلگرام
     username: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class Category(Base):
@@ -60,7 +68,7 @@ class Product(Base):
 
 
 class StockItem(Base):
-    """هر آیتم = یک اپل‌آیدی / شماره / ... که بعد از تایید به خریدار ارسال می‌شود"""
+    """هر آیتم = یک اپل‌آیدی / شماره / ... که بعد از تایید به خریدار ارسال می‌شه"""
     __tablename__ = "stock"
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
@@ -77,7 +85,7 @@ class Order(Base):
     status: Mapped[str] = mapped_column(String(20), default="waiting_receipt", index=True)
     receipt_file_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     receipt_type: Mapped[str | None] = mapped_column(String(10), nullable=True)  # photo / document
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     product: Mapped[Product] = relationship(lazy="selectin")
 
 
@@ -122,14 +130,47 @@ async def all_products():
         return (await s.execute(select(Product).order_by(Product.id))).scalars().all()
 
 
-# ============================ کمکی‌ها ============================
-async def is_member(bot: Bot, user_id: int) -> bool:
+# ============================ عضویت اجباری ============================
+_alert_state = {"last": 0.0}
+
+
+async def alert_admins(bot: Bot, text: str):
+    """هشدار به ادمین‌ها، حداکثر یک بار در ۱۰ دقیقه تا اسپم نشه"""
+    now = time.monotonic()
+    if now - _alert_state["last"] < 600:
+        return
+    _alert_state["last"] = now
+    for aid in ADMIN_IDS:
+        try:
+            await bot.send_message(aid, text)
+        except Exception:
+            logging.exception("could not notify admin %s", aid)
+
+
+async def check_membership(bot: Bot, user_id: int) -> bool | None:
+    """
+    True  -> عضو است
+    False -> عضو نیست
+    None  -> خود بررسی انجام نشد (مثلا ربات در کانال ادمین نیست)
+    """
+    if user_id in ADMIN_IDS:
+        return True
     try:
-        m = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-        return m.status in {ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER}
-    except Exception:
-        logging.exception("membership check failed; is the bot an admin of the channel?")
-        return False
+        member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
+    except Exception as e:
+        logging.exception("membership check failed")
+        await alert_admins(
+            bot,
+            f"⚠️ بررسی عضویت در {REQUIRED_CHANNEL} انجام نشد.\n"
+            f"خطا: {e}\n\n"
+            f"ربات را در تنظیمات کانال به‌عنوان ادمین اضافه کنید.",
+        )
+        return None
+    return member.status in {
+        ChatMemberStatus.CREATOR,
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.MEMBER,
+    }
 
 
 def join_kb():
@@ -140,24 +181,56 @@ def join_kb():
     return kb.as_markup()
 
 
-async def main_menu_kb():
+class ForceJoin(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user is None:
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery) and event.data == "check_join":
+            return await handler(event, data)
+        if isinstance(event, Message) and event.text and event.text.startswith("/start"):
+            return await handler(event, data)
+
+        status = await check_membership(event.bot, user.id)
+        if status is True:
+            return await handler(event, data)
+
+        if isinstance(event, CallbackQuery):
+            await event.answer(
+                SERVICE_DOWN_TEXT if status is None else NOT_MEMBER_ALERT,
+                show_alert=True,
+            )
+        elif status is None:
+            await event.answer(SERVICE_DOWN_TEXT)
+        else:
+            await event.answer(JOIN_TEXT, reply_markup=join_kb())
+        return None
+
+
+# ============================ منو و نمایش ============================
+async def menu_view():
+    cats = await all_categories()
     kb = InlineKeyboardBuilder()
-    for c in await all_categories():
+    for c in cats:
         kb.button(text=c.name, callback_data=f"cat:{c.id}")
     kb.adjust(2)
-    return kb.as_markup()
+    text = WELCOME if cats else "🏠 <b>منوی اصلی</b>\nفعلاً خدمتی فعال نیست."
+    return text, kb.as_markup()
 
 
 async def show(cb: CallbackQuery, text: str, kb=None):
-    """ویرایش پیام فعلی؛ اگر نشد، پیام جدید می‌فرستد"""
+    """ویرایش پیام فعلی؛ اگه نشد (مثلا پیام عکس بود) پیام جدید می‌فرسته"""
     try:
         await cb.message.edit_text(text, reply_markup=kb)
-    except Exception:
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            return
         await cb.message.answer(text, reply_markup=kb)
 
 
+# ============================ سفارش ============================
 async def send_order_card(bot: Bot, chat_id: int, order_id: int):
-    """کارت سفارش + رسید + دکمه تایید/رد برای ادمین"""
+    """کارت سفارش + رسید + دکمه‌ی تایید/رد برای ادمین"""
     async with Session() as s:
         order = await s.get(Order, order_id)
     text = (
@@ -177,7 +250,7 @@ async def send_order_card(bot: Bot, chat_id: int, order_id: int):
 
 
 async def deliver_order(bot: Bot, order_id: int) -> tuple[str, str]:
-    """یک آیتم آزاد از موجودی برمی‌دارد و برای خریدار می‌فرستد"""
+    """یک آیتم آزاد از موجودی برمی‌داره و برای خریدار می‌فرسته"""
     async with Session() as s:
         order = await s.get(Order, order_id)
         if not order or order.status != "pending":
@@ -193,6 +266,7 @@ async def deliver_order(bot: Bot, order_id: int) -> tuple[str, str]:
         order.status = "approved"
         await s.commit()
         user_id, name, content = order.user_id, order.product.name, item.content
+
     try:
         await bot.send_message(
             user_id,
@@ -220,27 +294,7 @@ async def reject_order(bot: Bot, order_id: int) -> bool:
     return True
 
 
-# ============================ میدل‌ویر عضویت اجباری ============================
-class ForceJoin(BaseMiddleware):
-    async def __call__(self, handler, event, data):
-        user = data.get("event_from_user")
-        if user is None or user.id in ADMIN_IDS:
-            return await handler(event, data)
-        if isinstance(event, CallbackQuery) and event.data == "check_join":
-            return await handler(event, data)
-        if isinstance(event, Message) and event.text and event.text.startswith("/start"):
-            return await handler(event, data)
-        if await is_member(event.bot, user.id):
-            return await handler(event, data)
-
-        if isinstance(event, CallbackQuery):
-            await event.answer("ابتدا در کانال عضو شوید.", show_alert=True)
-        else:
-            await event.answer("ابتدا در کانال عضو شوید، سپس /start را بزنید.", reply_markup=join_kb())
-        return None
-
-
-# ============================ روترها ============================
+# ============================ روترها و استیت‌ها ============================
 user = Router()
 user.message.outer_middleware(ForceJoin())
 user.callback_query.outer_middleware(ForceJoin())
@@ -267,35 +321,41 @@ class AdminFlow(StatesGroup):
 @user.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+    uid = message.from_user.id
     async with Session() as s:
-        if not await s.get(User, message.from_user.id):
-            s.add(User(id=message.from_user.id, username=message.from_user.username))
+        if not await s.get(User, uid):
+            s.add(User(id=uid, username=message.from_user.username))
             await s.commit()
 
-    if await is_member(message.bot, message.from_user.id) or message.from_user.id in ADMIN_IDS:
-        await message.answer(WELCOME, reply_markup=await main_menu_kb())
+    status = await check_membership(message.bot, uid)
+    if status is True:
+        text, kb = await menu_view()
+        await message.answer(text, reply_markup=kb)
+    elif status is None:
+        await message.answer(SERVICE_DOWN_TEXT)
     else:
-        await message.answer(
-            "👋 برای استفاده از ربات ابتدا باید در کانال ما عضو شوید.\n\n"
-            "پس از عضویت، دکمه «✅ عضو شدم» را بزنید.",
-            reply_markup=join_kb(),
-        )
+        await message.answer(JOIN_TEXT, reply_markup=join_kb())
 
 
 @user.callback_query(F.data == "check_join")
 async def cb_check_join(cb: CallbackQuery):
-    if await is_member(cb.bot, cb.from_user.id):
+    status = await check_membership(cb.bot, cb.from_user.id)
+    if status is True:
         await cb.answer("✅ عضویت شما تایید شد")
         await show(cb, "✅ عضویت شما تایید شد.")
-        await cb.message.answer(WELCOME, reply_markup=await main_menu_kb())
+        text, kb = await menu_view()
+        await cb.message.answer(text, reply_markup=kb)
+    elif status is None:
+        await cb.answer(SERVICE_DOWN_TEXT, show_alert=True)
     else:
-        await cb.answer("❌ هنوز عضو کانال نشده‌اید!", show_alert=True)
+        await cb.answer(NOT_MEMBER_ALERT, show_alert=True)
 
 
 @user.callback_query(F.data == "menu")
 async def cb_menu(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await show(cb, WELCOME, await main_menu_kb())
+    text, kb = await menu_view()
+    await show(cb, text, kb)
     await cb.answer()
 
 
@@ -338,7 +398,7 @@ async def cb_product(cb: CallbackQuery):
 
     text = (f"📦 <b>{html.escape(p.name)}</b>\n"
             f"💰 قیمت: {html.escape(p.price)}\n\n"
-            f"{html.escape(p.description or '')}")
+            f"{html.escape(p.description or '')}").strip()
     kb = InlineKeyboardBuilder()
     if stock_left:
         kb.button(text="🛒 خرید", callback_data=f"buy:{pid}")
@@ -346,7 +406,7 @@ async def cb_product(cb: CallbackQuery):
         text += "\n\n⛔️ فعلاً ناموجود است."
     kb.button(text="🔙 بازگشت", callback_data=f"cat:{p.category_id}")
     kb.adjust(1)
-    await show(cb, text.strip(), kb.as_markup())
+    await show(cb, text, kb.as_markup())
     await cb.answer()
 
 
@@ -377,6 +437,12 @@ async def cb_buy_confirmed(cb: CallbackQuery, state: FSMContext):
         p = await s.get(Product, pid)
         if not p:
             return await cb.answer("محصول پیدا نشد.", show_alert=True)
+        stock_left = await s.scalar(
+            select(func.count()).select_from(StockItem)
+            .where(StockItem.product_id == pid, StockItem.sold.is_(False))
+        )
+        if not stock_left:
+            return await cb.answer("⛔️ این محصول فعلاً ناموجود است.", show_alert=True)
         order = Order(user_id=cb.from_user.id, product_id=pid)
         s.add(order)
         await s.commit()
@@ -611,7 +677,7 @@ async def cb_order_decision(cb: CallbackQuery):
     await cb.answer()
     try:
         await cb.message.edit_caption(caption=f"{cb.message.caption or ''}\n\n{status}", reply_markup=None)
-    except Exception:
+    except TelegramBadRequest:
         pass
 
 
@@ -619,7 +685,9 @@ async def cb_order_decision(cb: CallbackQuery):
 async def main():
     logging.basicConfig(level=logging.INFO)
     if BOT_TOKEN == "PUT_YOUR_TOKEN_HERE":
-        raise SystemExit("توکن ربات را در BOT_TOKEN یا متغیر محیطی قرار دهید.")
+        raise SystemExit("توکن ربات را در متغیر BOT_TOKEN قرار دهید.")
+    if 123456789 in ADMIN_IDS:
+        logging.warning("ADMIN_IDS هنوز مقدار پیش‌فرض دارد؛ متغیر ADMIN_IDS را تنظیم کنید.")
 
     await init_db()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
