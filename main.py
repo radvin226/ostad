@@ -8,12 +8,11 @@ import asyncio
 import html
 import logging
 import os
-import time
 from datetime import datetime
 
-from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -26,19 +25,15 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 # ============================ تنظیمات ============================
+# ============================ تنظیمات ============================
 # همه‌ی این‌ها از متغیر محیطی خونده می‌شن؛ مقدار پیش‌فرض فقط برای تست محلیه
 BOT_TOKEN = os.getenv("9201680404:AAFe2RAWyF3Sn9lnLXbCcgEQYFUSDzAYf8I", "9201680404:AAFe2RAWyF3Sn9lnLXbCcgEQYFUSDzAYf8I")
 ADMIN_IDS = {int(x) for x in os.getenv("6420547446,5088592670","6420547446,5088592670").split(",") if x.strip()}
-REQUIRED_CHANNEL = "@sofi_vpn"                 # کانال اجباری؛ ربات باید در این کانال ادمین باشد
-CHANNEL_URL = "https://t.me/sofi_vpn"
 DEFAULT_CARD = "6037-0000-0000-0000"           # از پنل ادمین قابل تغییره
 DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:///shop.db")
 
 WELCOME = "🏠 <b>منوی اصلی</b>\nیکی از خدمات زیر را انتخاب کنید:"
-JOIN_TEXT = ("👋 برای استفاده از ربات ابتدا باید در کانال ما عضو شوید.\n\n"
-             "پس از عضویت، دکمه «✅ عضو شدم» را بزنید.")
-NOT_MEMBER_ALERT = "❌ هنوز عضو کانال نشده‌اید!"
-SERVICE_DOWN_TEXT = "⚠️ بررسی عضویت در حال حاضر ممکن نیست. کمی بعد دوباره تلاش کنید."
+EMPTY_MENU = "🏠 <b>منوی اصلی</b>\nفعلاً خدمتی فعال نیست."
 
 # ============================ دیتابیس ============================
 class Base(DeclarativeBase):
@@ -130,83 +125,6 @@ async def all_products():
         return (await s.execute(select(Product).order_by(Product.id))).scalars().all()
 
 
-# ============================ عضویت اجباری ============================
-_alert_state = {"last": 0.0}
-
-
-async def alert_admins(bot: Bot, text: str):
-    """هشدار به ادمین‌ها، حداکثر یک بار در ۱۰ دقیقه تا اسپم نشه"""
-    now = time.monotonic()
-    if now - _alert_state["last"] < 600:
-        return
-    _alert_state["last"] = now
-    for aid in ADMIN_IDS:
-        try:
-            await bot.send_message(aid, text)
-        except Exception:
-            logging.exception("could not notify admin %s", aid)
-
-
-async def check_membership(bot: Bot, user_id: int) -> bool | None:
-    """
-    True  -> عضو است
-    False -> عضو نیست
-    None  -> خود بررسی انجام نشد (مثلا ربات در کانال ادمین نیست)
-    """
-    if user_id in ADMIN_IDS:
-        return True
-    try:
-        member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-    except Exception as e:
-        logging.exception("membership check failed")
-        await alert_admins(
-            bot,
-            f"⚠️ بررسی عضویت در {REQUIRED_CHANNEL} انجام نشد.\n"
-            f"خطا: {e}\n\n"
-            f"ربات را در تنظیمات کانال به‌عنوان ادمین اضافه کنید.",
-        )
-        return None
-    return member.status in {
-        ChatMemberStatus.CREATOR,
-        ChatMemberStatus.ADMINISTRATOR,
-        ChatMemberStatus.MEMBER,
-    }
-
-
-def join_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📢 عضویت در کانال", url=CHANNEL_URL)
-    kb.button(text="✅ عضو شدم", callback_data="check_join")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-class ForceJoin(BaseMiddleware):
-    async def __call__(self, handler, event, data):
-        user = data.get("event_from_user")
-        if user is None:
-            return await handler(event, data)
-        if isinstance(event, CallbackQuery) and event.data == "check_join":
-            return await handler(event, data)
-        if isinstance(event, Message) and event.text and event.text.startswith("/start"):
-            return await handler(event, data)
-
-        status = await check_membership(event.bot, user.id)
-        if status is True:
-            return await handler(event, data)
-
-        if isinstance(event, CallbackQuery):
-            await event.answer(
-                SERVICE_DOWN_TEXT if status is None else NOT_MEMBER_ALERT,
-                show_alert=True,
-            )
-        elif status is None:
-            await event.answer(SERVICE_DOWN_TEXT)
-        else:
-            await event.answer(JOIN_TEXT, reply_markup=join_kb())
-        return None
-
-
 # ============================ منو و نمایش ============================
 async def menu_view():
     cats = await all_categories()
@@ -214,8 +132,7 @@ async def menu_view():
     for c in cats:
         kb.button(text=c.name, callback_data=f"cat:{c.id}")
     kb.adjust(2)
-    text = WELCOME if cats else "🏠 <b>منوی اصلی</b>\nفعلاً خدمتی فعال نیست."
-    return text, kb.as_markup()
+    return (WELCOME if cats else EMPTY_MENU), kb.as_markup()
 
 
 async def show(cb: CallbackQuery, text: str, kb=None):
@@ -296,8 +213,6 @@ async def reject_order(bot: Bot, order_id: int) -> bool:
 
 # ============================ روترها و استیت‌ها ============================
 user = Router()
-user.message.outer_middleware(ForceJoin())
-user.callback_query.outer_middleware(ForceJoin())
 
 admin = Router()
 admin.message.filter(F.from_user.id.in_(ADMIN_IDS))
@@ -326,29 +241,8 @@ async def cmd_start(message: Message, state: FSMContext):
         if not await s.get(User, uid):
             s.add(User(id=uid, username=message.from_user.username))
             await s.commit()
-
-    status = await check_membership(message.bot, uid)
-    if status is True:
-        text, kb = await menu_view()
-        await message.answer(text, reply_markup=kb)
-    elif status is None:
-        await message.answer(SERVICE_DOWN_TEXT)
-    else:
-        await message.answer(JOIN_TEXT, reply_markup=join_kb())
-
-
-@user.callback_query(F.data == "check_join")
-async def cb_check_join(cb: CallbackQuery):
-    status = await check_membership(cb.bot, cb.from_user.id)
-    if status is True:
-        await cb.answer("✅ عضویت شما تایید شد")
-        await show(cb, "✅ عضویت شما تایید شد.")
-        text, kb = await menu_view()
-        await cb.message.answer(text, reply_markup=kb)
-    elif status is None:
-        await cb.answer(SERVICE_DOWN_TEXT, show_alert=True)
-    else:
-        await cb.answer(NOT_MEMBER_ALERT, show_alert=True)
+    text, kb = await menu_view()
+    await message.answer(text, reply_markup=kb)
 
 
 @user.callback_query(F.data == "menu")
